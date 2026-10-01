@@ -4,8 +4,8 @@
 ================================================================================
 
  INSTALL
-   Put this in a LocalScript under StarterPlayer > StarterPlayerScripts.
-   (To use it as a ModuleScript: delete section 5 and add `return Nebula`.)
+   Put this in a LocalScript under StarterPlayer > StarterPlayerScripts,
+   or host it and load it as a library (it ends with `return Nebula`).
 
  FILE MAP  (search for the "[n]" tags to jump around)
    [1] Services
@@ -13,29 +13,41 @@
    [3] Utilities ................. small helpers shared by everything + createPlanet
    [4] Library
        [4.1] Window shell ........ backdrop layers, header, sidebar, page area
-       [4.2] Window state ........ dragging, toggle key, cleanup, notifications
+       [4.2] Window state ........ dragging, toggle key, cleanup, notifications,
+                                   flag registry (what the config system saves)
        [4.3] Window:AddTab ....... returns a Tab with all the element builders
-       [4.4] Window:AddSettingsTab  built-in Settings tab (menu keybind, unload)
-   [5] Example usage ............. delete when you build your own menu
+             Tab:AddConfigManager  the config box + Save / Load / Delete
+       [4.4] Window:AddSettingsTab / Window:AddConfigTab
+   [5] Example usage
 
  API QUICK REFERENCE
    local Window = Nebula.CreateWindow({Title, Subtitle, Size, ToggleKey})
    Window:AddTab(name, icon)            -> Tab
    Window:AddSettingsTab(name)          -> Tab   (menu keybind + unload button)
+   Window:AddConfigTab(name, {Folder})  -> Tab   (config list + save/load/delete)
    Window:Toggle()  Window:Destroy()
    Window:SetToggleKey(KeyCode)  Window:GetToggleKey()
    Window:Notify(title, text, seconds)
+   Window.Flags[flag]                   -> the element object, e.g. Window.Flags.Speed:Get()
 
    Tab:AddSection(text)
    Tab:AddLabel(text)                   -> {Set}
    Tab:AddButton({Name, Callback})
-   Tab:AddToggle({Name, Default, Callback(bool)})              -> {Get, Set}
-   Tab:AddSlider({Name, Min, Max, Step, Default, Suffix, Callback(number)})
-                                                               -> {Get, Set}
-   Tab:AddDropdown({Name, Options, Default, Callback(string)})  -> {Get, Set}
-   Tab:AddMultiDropdown({Name, Options, Default, Callback(table)}) -> {Get, Set}
-   Tab:AddColorPicker({Name, Default, Callback(Color3)})       -> {Get, Set}
-   Tab:AddKeybind({Name, Default, Callback(KeyCode)})          -> {Get, Set}
+   Tab:AddToggle({Name, Default, Flag, Callback(bool)})              -> {Get, Set}
+   Tab:AddSlider({Name, Min, Max, Step, Default, Suffix, Flag, Callback(number)})
+                                                                     -> {Get, Set}
+   Tab:AddDropdown({Name, Options, Default, Flag, Callback(string)})  -> {Get, Set}
+   Tab:AddMultiDropdown({Name, Options, Default, Flag, Callback(table)}) -> {Get, Set}
+   Tab:AddColorPicker({Name, Default, Flag, Callback(Color3)})       -> {Get, Set}
+   Tab:AddKeybind({Name, Default, Flag, Callback(KeyCode)})          -> {Get, Set}
+   Tab:AddConfigManager({Folder})       -> {Refresh}
+
+ CONFIG SYSTEM
+   Give any element a unique `Flag = "SomeName"` and it is saved/loaded
+   automatically. Elements without a Flag are ignored. Configs are stored as
+   JSON files in the executor workspace (default folder: NebulaUI/Configs).
+   If the environment has no file functions (writefile etc.), configs fall back
+   to in-memory storage and last until you leave the game.
 
  HOW THE BACKGROUND IS LAYERED (back to front)
    Backdrop (CanvasGroup, rounded — clips everything inside to the curve)
@@ -57,6 +69,7 @@
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
 
 local Nebula = {}
 
@@ -72,6 +85,7 @@ local Theme = {
 	Accent       = Color3.fromRGB(150, 90, 255),
 	Accent2      = Color3.fromRGB(70, 170, 255),
 	Pink         = Color3.fromRGB(255, 100, 200),
+	Danger       = Color3.fromRGB(255, 90, 120),
 	Text         = Color3.fromRGB(240, 235, 255),
 	SubText      = Color3.fromRGB(165, 155, 205),
 	Stroke       = Color3.fromRGB(95, 75, 180),
@@ -85,6 +99,7 @@ local Config = {
 	SidebarWidth     = 140,
 	DefaultToggleKey = Enum.KeyCode.RightShift,
 	StarCount        = 55,
+	ConfigFolder     = "NebulaUI/Configs",
 }
 
 ------------------------------------------------------------------------------
@@ -155,6 +170,23 @@ end
 -- Rounds `value` to the nearest multiple of `step` (and fixes float noise).
 local function roundTo(value, step)
 	return tonumber(string.format("%.4f", math.floor(value / step + 0.5) * step))
+end
+
+-- Do we have executor-style file access? (If not, configs live in memory only.)
+local HAS_FS = type(writefile) == "function"
+	and type(readfile) == "function"
+	and type(isfolder) == "function"
+	and type(makefolder) == "function"
+	and type(listfiles) == "function"
+	and type(delfile) == "function"
+
+-- Strips anything unsafe for a file name; trims and caps the length.
+local function sanitizeName(text)
+	local name = tostring(text or "")
+	name = string.gsub(name, "[^%w%s%-_]", "")
+	name = string.gsub(name, "^%s+", "")
+	name = string.gsub(name, "%s+$", "")
+	return string.sub(name, 1, 32)
 end
 
 local HUE_COLORS = ColorSequence.new({
@@ -300,6 +332,19 @@ function Nebula.CreateWindow(opts)
 	local listeningForKey = false-- true while a Keybind element is waiting for a key press
 	local toggleKey = opts.ToggleKey or Config.DefaultToggleKey
 	local minimized = false
+
+	-- Flag registry: every element created with a `Flag` ends up here. The config
+	-- system walks this table to save and load. Window.Flags exposes the objects
+	-- so you can also read values from your own code (Window.Flags.Speed:Get()).
+	local registry = {}          -- flag -> {kind, object, options}
+	Window.Flags = {}
+
+	local function register(o, kind, object)
+		if o and o.Flag then
+			registry[o.Flag] = {kind = kind, object = object, options = o.Options}
+			Window.Flags[o.Flag] = object
+		end
+	end
 
 	local function connect(signal, handler)
 		local connection = signal:Connect(handler)
@@ -1058,11 +1103,371 @@ function Nebula.CreateWindow(opts)
 			return object
 		end
 
+		-- ELEMENT: Config manager -------------------------------------------------------------------------
+		-- A name box, a clickable list of saved configs, and Save / Load / Delete buttons.
+		--   Click a config  -> selects it (and copies its name into the box)
+		--   Save            -> writes every flagged element to the name in the box
+		--                      (type a new name to create one, or select one to overwrite it)
+		--   Load            -> applies the selected config to the UI
+		--   Delete          -> press twice to confirm
+		function Tab:AddConfigManager(o)
+			o = o or {}
+			local folder = o.Folder or Config.ConfigFolder
+			local memory = {}      -- fallback storage when there is no file access
+			local selected = nil   -- name of the selected config
+			local rows = {}        -- name -> {button, label, bar}
+
+			if not HAS_FS then
+				Tab:AddLabel("No file access here — configs last this session only.")
+			end
+
+			---------------------------------------------------------------- storage
+			local function ensureFolder()
+				local path = ""
+				for part in string.gmatch(folder, "[^/]+") do
+					path = (path == "") and part or (path .. "/" .. part)
+					if not isfolder(path) then makefolder(path) end
+				end
+			end
+			local function pathFor(name) return folder .. "/" .. name .. ".json" end
+
+			local function listConfigs()
+				local names = {}
+				if HAS_FS then
+					pcall(ensureFolder)
+					local ok, files = pcall(listfiles, folder)
+					if ok and type(files) == "table" then
+						for _, file in ipairs(files) do
+							local name = string.match(tostring(file), "([^/\\]+)%.json$")
+							if name then table.insert(names, name) end
+						end
+					end
+				else
+					for name in pairs(memory) do table.insert(names, name) end
+				end
+				table.sort(names, function(a, b) return string.lower(a) < string.lower(b) end)
+				return names
+			end
+
+			local function writeConfig(name, json)
+				if not HAS_FS then memory[name] = json return true end
+				return pcall(function()
+					ensureFolder()
+					writefile(pathFor(name), json)
+				end)
+			end
+
+			local function readConfig(name)
+				if not HAS_FS then
+					return memory[name] ~= nil, memory[name]
+				end
+				return pcall(readfile, pathFor(name))
+			end
+
+			local function removeConfig(name)
+				if not HAS_FS then memory[name] = nil return true end
+				return pcall(delfile, pathFor(name))
+			end
+
+			---------------------------------------------------------------- (de)serializing flags
+			local function serialize(item)
+				local value = item.object:Get()
+				if item.kind == "ColorPicker" then return value:ToHex() end
+				if item.kind == "Keybind" then return value.Name end
+				return value -- Toggle: bool, Slider: number, Dropdown: string, MultiDropdown: table
+			end
+
+			-- Returns true if the value was valid and got applied.
+			local function apply(item, value)
+				local kind, object = item.kind, item.object
+				if kind == "Toggle" then
+					if type(value) ~= "boolean" then return false end
+					object:Set(value)
+				elseif kind == "Slider" then
+					if type(value) ~= "number" then return false end
+					object:Set(value)
+				elseif kind == "Dropdown" then
+					if type(value) ~= "string" or not table.find(item.options or {}, value) then return false end
+					object:Set(value)
+				elseif kind == "MultiDropdown" then
+					if type(value) ~= "table" then return false end
+					local valid = {}
+					for _, option in ipairs(value) do
+						if table.find(item.options or {}, option) then table.insert(valid, option) end
+					end
+					object:Set(valid)
+				elseif kind == "ColorPicker" then
+					if type(value) ~= "string" then return false end
+					local ok, color = pcall(Color3.fromHex, value)
+					if not ok or not color then return false end
+					object:Set(color)
+				elseif kind == "Keybind" then
+					if type(value) ~= "string" then return false end
+					local ok, keyCode = pcall(function() return Enum.KeyCode[value] end)
+					if not ok or not keyCode then return false end
+					object:Set(keyCode)
+				else
+					return false
+				end
+				return true
+			end
+
+			local function collect()
+				local data = {}
+				for flag, item in pairs(registry) do
+					local ok, value = pcall(serialize, item)
+					if ok and value ~= nil then data[flag] = value end
+				end
+				return data
+			end
+
+			---------------------------------------------------------------- UI
+			local card = element(210)
+
+			local nameBox = create("TextBox", {
+				Position = UDim2.fromOffset(12, 10), Size = UDim2.new(1, -50, 0, 26), BackgroundColor3 = Theme.Input,
+				BackgroundTransparency = 0.2, Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = Theme.Text,
+				PlaceholderText = "Config name…", PlaceholderColor3 = Theme.SubText, ClearTextOnFocus = false,
+				Text = "", TextXAlignment = Enum.TextXAlignment.Left, Parent = card,
+			})
+			corner(nameBox, 6)
+			create("UIPadding", {PaddingLeft = UDim.new(0, 8), Parent = nameBox})
+			stroke(nameBox, Theme.Stroke, 0.6)
+
+			local refreshButton = create("TextButton", {
+				AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 10), Size = UDim2.fromOffset(26, 26),
+				BackgroundColor3 = Theme.Input, BackgroundTransparency = 0.2, Text = "↻", Font = Enum.Font.GothamBold,
+				TextSize = 15, TextColor3 = Theme.Accent2, AutoButtonColor = false, Parent = card,
+			})
+			corner(refreshButton, 6)
+			stroke(refreshButton, Theme.Stroke, 0.6)
+
+			local listHolder = create("ScrollingFrame", {
+				Position = UDim2.fromOffset(12, 44), Size = UDim2.new(1, -24, 0, 120),
+				BackgroundColor3 = Theme.Input, BackgroundTransparency = 0.2, BorderSizePixel = 0,
+				ScrollBarThickness = 2, ScrollBarImageColor3 = Theme.Accent, CanvasSize = UDim2.new(),
+				AutomaticCanvasSize = Enum.AutomaticSize.Y, Parent = card,
+			})
+			corner(listHolder, 6)
+			stroke(listHolder, Theme.Stroke, 0.7)
+			create("UIListLayout", {Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder, Parent = listHolder})
+			create("UIPadding", {
+				PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4),
+				Parent = listHolder,
+			})
+
+			local emptyLabel = create("TextLabel", {
+				BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 44), Size = UDim2.new(1, -24, 0, 120),
+				Font = Enum.Font.Gotham, Text = "No configs yet.\nType a name and press Save.", TextSize = 12,
+				TextColor3 = Theme.SubText, Parent = card,
+			})
+
+			local buttonRow = create("Frame", {
+				Position = UDim2.fromOffset(12, 172), Size = UDim2.new(1, -24, 0, 28), BackgroundTransparency = 1, Parent = card,
+			})
+			create("UIListLayout", {
+				FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6),
+				SortOrder = Enum.SortOrder.LayoutOrder, Parent = buttonRow,
+			})
+			local function actionButton(text, color, order)
+				local button = create("TextButton", {
+					Size = UDim2.new(1 / 3, -4, 1, 0), LayoutOrder = order, BackgroundColor3 = Theme.Input,
+					BackgroundTransparency = 0.1, Text = text, Font = Enum.Font.GothamBold, TextSize = 12,
+					TextColor3 = color, AutoButtonColor = false, Parent = buttonRow,
+				})
+				corner(button, 7)
+				stroke(button, color, 0.5)
+				button.MouseEnter:Connect(function()
+					tween(button, {BackgroundColor3 = color, TextColor3 = Color3.new(1, 1, 1)}, 0.15)
+				end)
+				button.MouseLeave:Connect(function()
+					tween(button, {BackgroundColor3 = Theme.Input, TextColor3 = color}, 0.15)
+				end)
+				return button
+			end
+			local saveButton = actionButton("Save", Theme.Accent, 1)
+			local loadButton = actionButton("Load", Theme.Accent2, 2)
+			local deleteButton = actionButton("Delete", Theme.Danger, 3)
+
+			refreshButton.MouseEnter:Connect(function() tween(refreshButton, {BackgroundColor3 = Theme.ElementHover}, 0.15) end)
+			refreshButton.MouseLeave:Connect(function() tween(refreshButton, {BackgroundColor3 = Theme.Input}, 0.15) end)
+
+			---------------------------------------------------------------- list rendering
+			local function notify(heading, text)
+				Window:Notify(heading, text, 3)
+			end
+
+			local function paintSelection()
+				for name, row in pairs(rows) do
+					local active = (name == selected)
+					tween(row.button, {BackgroundTransparency = active and 0.6 or 1}, 0.15)
+					tween(row.label, {TextColor3 = active and Theme.Text or Theme.SubText}, 0.15)
+					tween(row.bar, {Size = UDim2.fromOffset(3, active and 14 or 0)}, 0.15)
+				end
+			end
+
+			local function select(name)
+				selected = name
+				if name then nameBox.Text = name end
+				paintSelection()
+			end
+
+			local function refreshList()
+				for _, row in pairs(rows) do row.button:Destroy() end
+				rows = {}
+
+				local names = listConfigs()
+				if selected and not table.find(names, selected) then selected = nil end
+				emptyLabel.Visible = (#names == 0)
+
+				for index, name in ipairs(names) do
+					local button = create("TextButton", {
+						Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = Theme.Accent, BackgroundTransparency = 1,
+						Text = "", AutoButtonColor = false, LayoutOrder = index, Parent = listHolder,
+					})
+					corner(button, 5)
+					local label = create("TextLabel", {
+						BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -16, 1, 0),
+						Font = Enum.Font.GothamMedium, Text = name, TextSize = 12, TextColor3 = Theme.SubText,
+						TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = button,
+					})
+					local bar = create("Frame", {
+						AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 3, 0.5, 0), Size = UDim2.fromOffset(3, 0),
+						BackgroundColor3 = Theme.Accent2, BorderSizePixel = 0, Parent = button,
+					})
+					corner(bar, 2)
+					rows[name] = {button = button, label = label, bar = bar}
+
+					button.MouseEnter:Connect(function()
+						if selected ~= name then tween(button, {BackgroundTransparency = 0.85}, 0.12) end
+					end)
+					button.MouseLeave:Connect(function()
+						if selected ~= name then tween(button, {BackgroundTransparency = 1}, 0.12) end
+					end)
+					button.MouseButton1Click:Connect(function() select(name) end)
+				end
+				paintSelection()
+			end
+
+			---------------------------------------------------------------- actions
+			local function save()
+				local name = sanitizeName(nameBox.Text)
+				if name == "" then name = selected or "" end
+				if name == "" then
+					notify("Config", "Type a name for the config first.")
+					return
+				end
+
+				local existed = table.find(listConfigs(), name) ~= nil
+				local encoded, json = pcall(function()
+					return HttpService:JSONEncode({version = 1, flags = collect()})
+				end)
+				if not encoded then
+					notify("Save failed", "Couldn't encode the settings.")
+					return
+				end
+
+				local ok, err = writeConfig(name, json)
+				if not ok then
+					notify("Save failed", tostring(err))
+					return
+				end
+				selected = name
+				nameBox.Text = name
+				refreshList()
+				notify(existed and "Config overwritten" or "Config saved", "\"" .. name .. "\"")
+			end
+
+			local function load()
+				if not selected then
+					notify("Config", "Select a config from the list first.")
+					return
+				end
+				local ok, raw = readConfig(selected)
+				if not ok or type(raw) ~= "string" then
+					notify("Load failed", "Couldn't read \"" .. selected .. "\".")
+					refreshList()
+					return
+				end
+				local decoded, data = pcall(function() return HttpService:JSONDecode(raw) end)
+				if not decoded or type(data) ~= "table" or type(data.flags) ~= "table" then
+					notify("Load failed", "\"" .. selected .. "\" is corrupted.")
+					return
+				end
+
+				local count = 0
+				for flag, value in pairs(data.flags) do
+					local item = registry[flag]
+					if item then
+						local applied, result = pcall(apply, item, value)
+						if applied and result then count += 1 end
+					end
+				end
+				notify("Config loaded", "\"" .. selected .. "\" (" .. count .. " settings)")
+			end
+
+			local armToken = 0
+			local function resetDelete()
+				armToken += 1
+				deleteButton.Text = "Delete"
+			end
+			local function delete()
+				if not selected then
+					notify("Config", "Select a config from the list first.")
+					return
+				end
+				if deleteButton.Text ~= "Sure?" then
+					deleteButton.Text = "Sure?"
+					armToken += 1
+					local token = armToken
+					task.delay(2, function()
+						if token == armToken then deleteButton.Text = "Delete" end
+					end)
+					return
+				end
+				resetDelete()
+				local name = selected
+				local ok, err = removeConfig(name)
+				if not ok then
+					notify("Delete failed", tostring(err))
+					return
+				end
+				selected = nil
+				nameBox.Text = ""
+				refreshList()
+				notify("Config deleted", "\"" .. name .. "\"")
+			end
+
+			saveButton.MouseButton1Click:Connect(save)
+			loadButton.MouseButton1Click:Connect(load)
+			deleteButton.MouseButton1Click:Connect(delete)
+			refreshButton.MouseButton1Click:Connect(function()
+				refreshList()
+			end)
+
+			refreshList()
+			return {Refresh = refreshList}
+		end
+
+		-- Register every flagged element so the config system can find it.
+		-- (Wraps the builders above: same call, plus one extra line of bookkeeping.)
+		for method, kind in pairs({
+			AddToggle = "Toggle", AddSlider = "Slider", AddDropdown = "Dropdown",
+			AddMultiDropdown = "MultiDropdown", AddColorPicker = "ColorPicker", AddKeybind = "Keybind",
+		}) do
+			local original = Tab[method]
+			Tab[method] = function(self, o)
+				local object = original(self, o)
+				register(o, kind, object)
+				return object
+			end
+		end
+
 		return Tab
 	end
 
 	--------------------------------------------------------------------------
-	-- [4.4] Window:AddSettingsTab — the built-in Settings tab
+	-- [4.4] Window:AddSettingsTab / Window:AddConfigTab
 	--------------------------------------------------------------------------
 	function Window:AddSettingsTab(name)
 		local tab = Window:AddTab(name or "Settings", "⚙")
@@ -1079,13 +1484,33 @@ function Nebula.CreateWindow(opts)
 		return tab
 	end
 
+	function Window:AddConfigTab(name, o)
+		local tab = Window:AddTab(name or "Configs", "◈")
+		tab:AddSection("Configs")
+		tab:AddConfigManager(o)
+		return tab
+	end
+
 	return Window
 end
 
 ------------------------------------------------------------------------------
--- [5] EXAMPLE USAGE  (delete from here down when building your own menu) or just leave the return nebula and load it from github as a library
+-- [5] EXAMPLE USAGE
 ------------------------------------------------------------------------------
+--[[
+local Nebula = loadstring(game:HttpGet("YOUR_RAW_URL_HERE"))()
 
+local Window = Nebula.CreateWindow({Title = "Nebula", Subtitle = "demo"})
 
+local Main = Window:AddTab("Main", "✦")
+Main:AddSection("Movement")
+Main:AddToggle({Name = "Speed", Flag = "SpeedOn", Callback = function(on) print("speed", on) end})
+Main:AddSlider({Name = "Walk Speed", Flag = "WalkSpeed", Min = 16, Max = 100, Default = 16, Suffix = " st/s"})
+Main:AddDropdown({Name = "Mode", Flag = "Mode", Options = {"Legit", "Rage"}, Default = "Legit"})
+Main:AddColorPicker({Name = "Accent", Flag = "AccentColor"})
+
+Window:AddConfigTab("Configs")   -- everything above with a Flag is saved/loaded
+Window:AddSettingsTab()
+]]
 
 return Nebula
