@@ -39,7 +39,8 @@
    Tab:AddDropdown({Name, Options, Default, Flag, Callback(string)})  -> {Get, Set}
    Tab:AddMultiDropdown({Name, Options, Default, Flag, Callback(table)}) -> {Get, Set}
    Tab:AddColorPicker({Name, Default, Flag, Callback(Color3)})       -> {Get, Set}
-   Tab:AddKeybind({Name, Default, Flag, Callback(KeyCode)})          -> {Get, Set}
+   Tab:AddKeybind({Name, Default, Flag, Callback(bind)})             -> {Get, Set}
+       bind is an Enum.KeyCode, or Enum.UserInputType.MouseButton1/2/3 for mouse binds
    Tab:AddConfigManager({Folder})       -> {Refresh}
 
  CONFIG SYSTEM
@@ -187,6 +188,33 @@ local function sanitizeName(text)
 	name = string.gsub(name, "^%s+", "")
 	name = string.gsub(name, "%s+$", "")
 	return string.sub(name, 1, 32)
+end
+
+-- Binds can be a keyboard key (Enum.KeyCode) or a mouse button (Enum.UserInputType).
+local MOUSE_BINDS = {
+	MouseButton1 = Enum.UserInputType.MouseButton1,
+	MouseButton2 = Enum.UserInputType.MouseButton2,
+	MouseButton3 = Enum.UserInputType.MouseButton3,
+}
+local MOUSE_LABELS = {MouseButton1 = "Mouse 1", MouseButton2 = "Mouse 2", MouseButton3 = "Mouse 3"}
+
+-- Text shown on the keybind chip ("RightShift", "Mouse 2", ...).
+local function bindName(bind)
+	if bind.EnumType == Enum.UserInputType then return MOUSE_LABELS[bind.Name] or bind.Name end
+	return bind.Name
+end
+
+-- Does this input event match the bind?
+local function bindMatches(input, bind)
+	if bind.EnumType == Enum.UserInputType then return input.UserInputType == bind end
+	return input.KeyCode == bind
+end
+
+-- Turns a saved name (bind.Name) back into the enum item, or nil if it's invalid.
+local function bindFromName(name)
+	if MOUSE_BINDS[name] then return MOUSE_BINDS[name] end
+	local ok, keyCode = pcall(function() return Enum.KeyCode[name] end)
+	return ok and keyCode or nil
 end
 
 local HUE_COLORS = ColorSequence.new({
@@ -583,7 +611,7 @@ function Nebula.CreateWindow(opts)
 	-- while a Keybind element is waiting for input (listeningForKey).
 	connect(UIS.InputBegan, function(input, processed)
 		if processed or listeningForKey then return end
-		if input.KeyCode == toggleKey then Window:Toggle() end
+		if bindMatches(input, toggleKey) then Window:Toggle() end
 	end)
 
 	function Window:Toggle() main.Visible = not main.Visible end
@@ -1069,7 +1097,7 @@ function Nebula.CreateWindow(opts)
 
 			local listenConnection = nil
 			local function render()
-				chip.Text = key.Name
+				chip.Text = bindName(key)
 				chipStroke.Color = Theme.Stroke
 			end
 			local function stopListening()
@@ -1078,16 +1106,35 @@ function Nebula.CreateWindow(opts)
 				-- Small delay so the key that was just bound can't also trigger the menu toggle.
 				task.delay(0.15, function() listeningForKey = false end)
 			end
+			local function insideCard(pos)
+				local p, s = card.AbsolutePosition, card.AbsoluteSize
+				return pos.X >= p.X and pos.X <= p.X + s.X and pos.Y >= p.Y and pos.Y <= p.Y + s.Y
+			end
 			local function startListening()
 				listeningForKey = true
 				chip.Text = "press a key…"
 				chipStroke.Color = Theme.Accent
 				listenConnection = connect(UIS.InputBegan, function(input)
-					if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-					if input.KeyCode ~= Enum.KeyCode.Escape then
-						key = input.KeyCode
-						fire(o.Callback, key)
+					local bind
+					local inputType = input.UserInputType
+					if inputType == Enum.UserInputType.Keyboard then
+						if input.KeyCode == Enum.KeyCode.Escape then
+							stopListening() -- Escape cancels
+							return
+						end
+						bind = input.KeyCode
+					elseif inputType == Enum.UserInputType.MouseButton2 or inputType == Enum.UserInputType.MouseButton3 then
+						bind = inputType
+					elseif inputType == Enum.UserInputType.MouseButton1 then
+						-- Left-clicking this element cancels (handled by its click below);
+						-- left-clicking anywhere else binds Mouse 1.
+						if insideCard(input.Position) then return end
+						bind = inputType
+					else
+						return
 					end
+					key = bind
+					fire(o.Callback, key)
 					stopListening()
 				end)
 			end
@@ -1203,9 +1250,9 @@ function Nebula.CreateWindow(opts)
 					object:Set(color)
 				elseif kind == "Keybind" then
 					if type(value) ~= "string" then return false end
-					local ok, keyCode = pcall(function() return Enum.KeyCode[value] end)
-					if not ok or not keyCode then return false end
-					object:Set(keyCode)
+					local bind = bindFromName(value)
+					if not bind then return false end
+					object:Set(bind)
 				else
 					return false
 				end
@@ -1477,7 +1524,7 @@ function Nebula.CreateWindow(opts)
 			Default = toggleKey,
 			Callback = function(keyCode)
 				Window:SetToggleKey(keyCode)
-				Window:Notify("Keybind updated", "Menu now toggles with " .. keyCode.Name .. ".", 3)
+				Window:Notify("Keybind updated", "Menu now toggles with " .. bindName(keyCode) .. ".", 3)
 			end,
 		})
 		tab:AddButton({Name = "Unload UI", Callback = function() Window:Destroy() end})
